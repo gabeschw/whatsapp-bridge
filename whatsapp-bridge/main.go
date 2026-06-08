@@ -46,6 +46,13 @@ var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
 var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 	"Request full history at pair time (only effective when re-pairing; no-op for existing sessions)")
 
+var batchModeFlag = flag.Bool("batch", false,
+	"Run in batch mode: connect, collect messages until idle, then exit")
+var batchIdleTimeoutFlag = flag.Int("batch-idle-timeout", 15,
+	"Seconds of inactivity before considering batch sync complete")
+var batchMaxDurationFlag = flag.Int("batch-max-duration", 300,
+	"Absolute maximum seconds to stay connected in batch mode")
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -91,7 +98,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -121,6 +128,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
 			deleted_at TIMESTAMP,
+			inserted_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -169,6 +177,18 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
+	if err := ensureColumn(db, "messages", "inserted_at", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("failed to ensure messages.inserted_at column: %w", err)
+	}
+
+	// Indexes for LID migration queries and general message lookups.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_chat_jid ON messages(chat_jid)`); err != nil {
+		return fmt.Errorf("failed to create idx_messages_chat_jid: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender)`); err != nil {
+		return fmt.Errorf("failed to create idx_messages_sender: %w", err)
+	}
+
 	return nil
 }
 
@@ -636,8 +656,8 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, inserted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender,
 			content = excluded.content,
@@ -1552,19 +1572,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Forward self-messages when FORWARD_SELF=true.
 	// Always forward image messages (even without a text caption) so the AI vision
 	// pipeline can analyse the image content.
-	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
-	hasText := content != ""
-	hasImage := mediaType == "image"
+	//
+	// Skip all webhooks in batch mode — the caller reads from messages.db directly.
+	if !*batchModeFlag {
+		shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
+		hasText := content != ""
+		hasImage := mediaType == "image"
 
-	if shouldForward && (hasText || hasImage) {
-		if hasImage {
-			SendWebhookWithMedia(
-				sender, content, chatJID, msg.Info.IsFromMe,
-				quotedMessageId, quotedSender, quotedContent,
-				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
-			)
-		} else {
-			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
+		if shouldForward && (hasText || hasImage) {
+			if hasImage {
+				SendWebhookWithMedia(
+					sender, content, chatJID, msg.Info.IsFromMe,
+					quotedMessageId, quotedSender, quotedContent,
+					msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
+				)
+			} else {
+				SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent)
+			}
 		}
 	}
 
@@ -2094,7 +2118,7 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -2164,6 +2188,13 @@ func main() {
 
 	// Channel to signal reconnection needs
 	reconnectChan := make(chan bool, 1)
+	exitChan := make(chan os.Signal, 1)
+	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Buffered channel so batch mode can detect idle (no new messages for
+	// --batch-idle-timeout seconds). Unbuffered would risk blocking the
+	// event handler goroutine during bursts.
+	msgReceived := make(chan struct{}, 100)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -2171,10 +2202,18 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+			select {
+			case msgReceived <- struct{}{}:
+			default:
+			}
 
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+			select {
+			case msgReceived <- struct{}{}:
+			default:
+			}
 
 		case *events.GroupInfo:
 			if v.Ephemeral != nil {
@@ -2277,10 +2316,24 @@ func main() {
 
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
+	var connErr error
+	maxRetries := 3
+
+	// In batch mode, skip the retry loop: require an existing session,
+	// try connect once, and fail fast.
+	if *batchModeFlag {
+		if client.Store.ID == nil {
+			logger.Errorf("Batch mode requires an existing session. Pair first with normal mode (run without --batch).")
+			return
+		}
+		if err := client.Connect(); err != nil {
+			logger.Errorf("Failed to connect: %v", err)
+			return
+		}
+		goto connectionSuccess
+	}
 
 	// Add connection retry logic
-	maxRetries := 3
-	var connErr error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		logger.Infof("Connection attempt %d/%d...", attempt, maxRetries)
@@ -2372,6 +2425,59 @@ connectionSuccess:
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Batch mode: collect messages until idle, then exit.
+	if *batchModeFlag {
+		idleTimeout := time.Duration(*batchIdleTimeoutFlag) * time.Second
+		maxDuration := time.Duration(*batchMaxDurationFlag) * time.Second
+
+		fmt.Printf("\nBatch mode: collecting messages...\n")
+		fmt.Printf("  Idle timeout: %v (exit after no new messages for this long)\n", idleTimeout)
+		fmt.Printf("  Max duration: %v (hard limit)\n", maxDuration)
+		fmt.Println("  Messages will be stored in store/messages.db")
+
+		maxTimer := time.NewTimer(maxDuration)
+		idleTimer := time.NewTimer(idleTimeout)
+		msgCount := 0
+
+		for {
+			select {
+			case <-msgReceived:
+				msgCount++
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
+					}
+				}
+				idleTimer.Reset(idleTimeout)
+
+			case <-idleTimer.C:
+				fmt.Printf("Batch complete: idle for %v, no more pending messages.\n", idleTimeout)
+				goto batchDone
+
+			case <-maxTimer.C:
+				fmt.Printf("Batch complete: max duration %v reached.\n", maxDuration)
+				goto batchDone
+
+			case sig := <-exitChan:
+				fmt.Printf("Received %v, disconnecting...\n", sig)
+				goto batchDone
+			}
+		}
+
+	batchDone:
+		client.Disconnect()
+
+		var totalMessages int
+		if err := messageStore.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&totalMessages); err == nil {
+			fmt.Printf("%d messages received this run, %d total in database.\n", msgCount, totalMessages)
+		} else {
+			fmt.Printf("%d messages received this run.\n", msgCount)
+		}
+		// return so deferred cleanup runs (messageStore.Close etc.)
+		return
+	}
+
 	// Start REST API server
 	port := 8080
 	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
@@ -2404,10 +2510,6 @@ connectionSuccess:
 	logger.Infof("Allowed media roots: %v", allowedMediaRoots)
 
 	startRESTServer(client, messageStore, port, bridgeToken, allowedMediaRoots)
-
-	// Create a channel to keep the main goroutine alive
-	exitChan := make(chan os.Signal, 1)
-	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
