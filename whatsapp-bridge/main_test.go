@@ -106,6 +106,7 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_length INTEGER,
 			deleted_at TIMESTAMP,
 			quoted_message_id TEXT,
+			inserted_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -878,6 +879,114 @@ func TestHandleHistorySync_LIDParticipant_ResolvedViaStore(t *testing.T) {
 	if got != participantPhone.User {
 		t.Errorf("history-sync sender = %q, want resolved phone user %q (raw LID was %q)",
 			got, participantPhone.User, participantLID.User)
+	}
+}
+
+// TestHandleHistorySync_GroupMessage_TopLevelParticipant exercises the
+// history-sync code path for group messages where Key.Participant is nil
+// but the top-level WebMessageInfo.Participant field carries the sender.
+// Before the fix, this fell through to rawSender = jid (the group JID),
+// storing the group's user part as the sender instead of the actual sender.
+func TestHandleHistorySync_GroupMessage_TopLevelParticipant(t *testing.T) {
+	groupJID := "120363144228102208@g.us"
+	senderPhone := types.JID{User: "12013672186", Server: types.DefaultUserServer}
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	if err := ms.StoreChat(groupJID, "Test Group", time.Now()); err != nil {
+		t.Fatalf("seed group chat: %v", err)
+	}
+
+	historySync := &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{
+				{
+					ID: proto.String(groupJID),
+					Messages: []*waProto.HistorySyncMsg{
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-group-001"),
+									FromMe: proto.Bool(false),
+									// Key.Participant intentionally nil — simulates
+									// group history sync rows where it's absent.
+								},
+								// Top-level Participant field (protobuf field 5)
+								// carries the actual sender for group messages.
+								// Always a full JID in practice.
+								Participant:      proto.String(senderPhone.String()),
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									Conversation: proto.String("group message via top-level participant"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	handleHistorySync(client, ms, historySync, logger)
+
+	got := querySender(ms, groupJID)
+	if got != senderPhone.User {
+		t.Errorf("history-sync group sender = %q, want sender phone %q (must not be group JID user part %q)",
+			got, senderPhone.User, "120363144228102208")
+	}
+}
+
+// TestHandleHistorySync_GroupMessage_NoParticipantAtAll ensures that when
+// both Key.Participant and the top-level Participant are nil, the sender
+// falls back to the group JID user part (existing behavior, preserves
+// backward compatibility for edge cases where neither field is populated).
+func TestHandleHistorySync_GroupMessage_NoParticipantAtAll(t *testing.T) {
+	groupJID := "120363144228102208@g.us"
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	if err := ms.StoreChat(groupJID, "Test Group", time.Now()); err != nil {
+		t.Fatalf("seed group chat: %v", err)
+	}
+
+	historySync := &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{
+				{
+					ID: proto.String(groupJID),
+					Messages: []*waProto.HistorySyncMsg{
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-group-nopart-001"),
+									FromMe: proto.Bool(false),
+								},
+								// Neither Key.Participant nor top-level Participant
+								// is set — must fall back to group JID user part.
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									Conversation: proto.String("fallback group message"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	handleHistorySync(client, ms, historySync, logger)
+
+	got := querySender(ms, groupJID)
+	if got != "120363144228102208" {
+		t.Errorf("history-sync fallback sender = %q, want group JID user part %q",
+			got, "120363144228102208")
 	}
 }
 

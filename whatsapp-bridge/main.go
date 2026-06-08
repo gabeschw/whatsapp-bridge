@@ -2812,24 +2812,36 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
-					var rawSender types.JID
-					switch {
-					case isFromMe && client.Store.ID != nil:
-						rawSender = client.Store.ID.ToNonAD()
-					case msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "":
-						if parsed, perr := types.ParseJID(*msg.Message.Key.Participant); perr == nil {
-							rawSender = parsed
-						} else {
-							rawSender = types.JID{User: *msg.Message.Key.Participant}
-						}
-					default:
-						rawSender = jid
+				var rawSender types.JID
+				switch {
+				case isFromMe && client.Store.ID != nil:
+					rawSender = client.Store.ID.ToNonAD()
+				case msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "":
+					if parsed, perr := types.ParseJID(*msg.Message.Key.Participant); perr == nil {
+						rawSender = parsed
+					} else {
+						rawSender = types.JID{User: *msg.Message.Key.Participant}
 					}
+				case msg.Message.Participant != nil && *msg.Message.Participant != "":
+					if parsed, perr := types.ParseJID(*msg.Message.Participant); perr == nil {
+						rawSender = parsed
+					} else {
+						rawSender = types.JID{User: *msg.Message.Participant}
+					}
+				default:
+					rawSender = jid
+				}
 					var alt types.JID
 					if isFromMe && client.Store.ID != nil {
 						alt = client.Store.ID.ToNonAD()
 					}
 					sender = resolveUserJID(client, rawSender, alt).User
+				} else if msg.Message.Participant != nil && *msg.Message.Participant != "" {
+					if parsed, perr := types.ParseJID(*msg.Message.Participant); perr == nil {
+						sender = resolveUserJID(client, parsed, types.EmptyJID).User
+					} else {
+						sender = types.JID{User: *msg.Message.Participant}.User
+					}
 				} else {
 					sender = jid.User
 				}
