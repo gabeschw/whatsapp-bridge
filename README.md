@@ -5,8 +5,6 @@
 
 Standalone Go bridge for WhatsApp Web — handles message send/receive, media download, webhook forwarding, and local SQLite storage via a REST API.
 
-> Derived from [verygoodplugins/whatsapp-mcp](https://github.com/verygoodplugins/whatsapp-mcp).
-
 ## Features
 
 - **REST API** — send/receive messages, manage media, query chats
