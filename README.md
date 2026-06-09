@@ -171,7 +171,60 @@ inserted with `result='in_progress'`. Subsequent `CallAccept` /
 sequence. See the state-machine comment above `StoreCallOffer` in `main.go`
 for the exact transitions.
 
-### Schema
+### Caveats
+
+- **Outbound calls are not captured.** WhatsApp's primary device handles
+  calls it initiates without notifying linked devices, so the bridge never
+  sees an event for them.
+- **Call results only reflect what the bridge saw.** If the bridge is
+  offline when a call happens, the events are lost.
+- **1:1 calls default to `call_type='voice'`.** `CallOffer` events don't
+  expose media type directly (it's buried in the binary call data). Group
+  calls via `CallOfferNotice` include a `Media` field and are recorded
+  accurately as voice or video.
+
+## Schema
+
+### Chats
+
+```sql
+CREATE TABLE chats (
+    jid TEXT PRIMARY KEY,
+    name TEXT,
+    last_message_time TIMESTAMP,
+    ephemeral_expiration INTEGER NOT NULL DEFAULT 0,
+    ephemeral_setting_timestamp INTEGER NOT NULL DEFAULT 0
+);
+```
+
+### Messages
+
+```sql
+CREATE TABLE messages (
+    id TEXT,
+    chat_jid TEXT,
+    sender TEXT,
+    content TEXT,
+    timestamp TIMESTAMP,
+    is_from_me BOOLEAN,
+    media_type TEXT,        -- 'image', 'video', 'audio', 'document', 'reaction'
+    filename TEXT,          -- for media: saved filename; for reactions: reacted-to message ID
+    url TEXT,
+    media_key BLOB,
+    file_sha256 BLOB,
+    file_enc_sha256 BLOB,
+    file_length INTEGER,
+    deleted_at TIMESTAMP,
+    quoted_message_id TEXT,
+    inserted_at TIMESTAMP,  -- set on first insert, never overwritten
+    PRIMARY KEY (id, chat_jid),
+    FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+);
+```
+
+Reactions are stored as regular rows with `media_type='reaction'`, the emoji in `content`, and the target message ID in `filename`.
+
+### Calls
 
 ```sql
 CREATE TABLE calls (
@@ -202,35 +255,6 @@ CREATE TABLE calls (
   expose media type directly (it's buried in the binary call data). Group
   calls via `CallOfferNotice` include a `Media` field and are recorded
   accurately as voice or video.
-
-## Messages Schema
-
-The `messages` table in `messages.db` stores all message data:
-
-```sql
-CREATE TABLE messages (
-    id TEXT,
-    chat_jid TEXT,
-    sender TEXT,
-    content TEXT,
-    timestamp TIMESTAMP,
-    is_from_me BOOLEAN,
-    media_type TEXT,        -- 'image', 'video', 'audio', 'document', 'reaction'
-    filename TEXT,          -- for media: saved filename; for reactions: reacted-to message ID
-    url TEXT,
-    media_key BLOB,
-    file_sha256 BLOB,
-    file_enc_sha256 BLOB,
-    file_length INTEGER,
-    deleted_at TIMESTAMP,
-    quoted_message_id TEXT,
-    inserted_at TIMESTAMP,  -- set on first insert, never overwritten
-    PRIMARY KEY (id, chat_jid),
-    FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-);
-```
-
-Reactions are stored as regular rows with `media_type='reaction'`, the emoji in `content`, and the target message ID in `filename`.
 
 ## Development
 
@@ -324,14 +348,10 @@ go env -w CGO_ENABLED=1
 go run .
 ```
 
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
-
 ## Credits
 
 Derived from [verygoodplugins/whatsapp-mcp](https://github.com/verygoodplugins/whatsapp-mcp),
-originally created by [Luke Harries](https://github.com/lharries).
+originally created by [Luke Harries](https://github.com/lharries/whatsapp-mcp).
 
 ## Links
 

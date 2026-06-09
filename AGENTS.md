@@ -39,6 +39,7 @@ Two SQLite DBs under `store/` (gitignored):
 
 ## Conventions
 
+- **Never commit without user confirmation.** Not even in build mode. Stage and show, then ask.
 - **Conventional commits** — `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`
 - **One concern per commit.** No mixed changes.
 - **No drive-by formatting.** Only reformat files you're already changing.
