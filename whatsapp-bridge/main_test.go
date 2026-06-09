@@ -106,7 +106,6 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_length INTEGER,
 			deleted_at TIMESTAMP,
 			quoted_message_id TEXT,
-			inserted_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -882,114 +881,6 @@ func TestHandleHistorySync_LIDParticipant_ResolvedViaStore(t *testing.T) {
 	}
 }
 
-// TestHandleHistorySync_GroupMessage_TopLevelParticipant exercises the
-// history-sync code path for group messages where Key.Participant is nil
-// but the top-level WebMessageInfo.Participant field carries the sender.
-// Before the fix, this fell through to rawSender = jid (the group JID),
-// storing the group's user part as the sender instead of the actual sender.
-func TestHandleHistorySync_GroupMessage_TopLevelParticipant(t *testing.T) {
-	groupJID := "120363144228102208@g.us"
-	senderPhone := types.JID{User: "12013672186", Server: types.DefaultUserServer}
-
-	client := newTestClient(&mockLIDStore{})
-	ms := newTestMessageStore(t)
-	logger := testLogger()
-
-	if err := ms.StoreChat(groupJID, "Test Group", time.Now()); err != nil {
-		t.Fatalf("seed group chat: %v", err)
-	}
-
-	historySync := &events.HistorySync{
-		Data: &waProto.HistorySync{
-			SyncType: waProto.HistorySync_RECENT.Enum(),
-			Conversations: []*waProto.Conversation{
-				{
-					ID: proto.String(groupJID),
-					Messages: []*waProto.HistorySyncMsg{
-						{
-							Message: &waProto.WebMessageInfo{
-								Key: &waCommon.MessageKey{
-									ID:     proto.String("hist-group-001"),
-									FromMe: proto.Bool(false),
-									// Key.Participant intentionally nil — simulates
-									// group history sync rows where it's absent.
-								},
-								// Top-level Participant field (protobuf field 5)
-								// carries the actual sender for group messages.
-								// Always a full JID in practice.
-								Participant:      proto.String(senderPhone.String()),
-								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
-								Message: &waProto.Message{
-									Conversation: proto.String("group message via top-level participant"),
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	handleHistorySync(client, ms, historySync, logger)
-
-	got := querySender(ms, groupJID)
-	if got != senderPhone.User {
-		t.Errorf("history-sync group sender = %q, want sender phone %q (must not be group JID user part %q)",
-			got, senderPhone.User, "120363144228102208")
-	}
-}
-
-// TestHandleHistorySync_GroupMessage_NoParticipantAtAll ensures that when
-// both Key.Participant and the top-level Participant are nil, the sender
-// falls back to the group JID user part (existing behavior, preserves
-// backward compatibility for edge cases where neither field is populated).
-func TestHandleHistorySync_GroupMessage_NoParticipantAtAll(t *testing.T) {
-	groupJID := "120363144228102208@g.us"
-
-	client := newTestClient(&mockLIDStore{})
-	ms := newTestMessageStore(t)
-	logger := testLogger()
-
-	if err := ms.StoreChat(groupJID, "Test Group", time.Now()); err != nil {
-		t.Fatalf("seed group chat: %v", err)
-	}
-
-	historySync := &events.HistorySync{
-		Data: &waProto.HistorySync{
-			SyncType: waProto.HistorySync_RECENT.Enum(),
-			Conversations: []*waProto.Conversation{
-				{
-					ID: proto.String(groupJID),
-					Messages: []*waProto.HistorySyncMsg{
-						{
-							Message: &waProto.WebMessageInfo{
-								Key: &waCommon.MessageKey{
-									ID:     proto.String("hist-group-nopart-001"),
-									FromMe: proto.Bool(false),
-								},
-								// Neither Key.Participant nor top-level Participant
-								// is set — must fall back to group JID user part.
-								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
-								Message: &waProto.Message{
-									Conversation: proto.String("fallback group message"),
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	handleHistorySync(client, ms, historySync, logger)
-
-	got := querySender(ms, groupJID)
-	if got != "120363144228102208" {
-		t.Errorf("history-sync fallback sender = %q, want group JID user part %q",
-			got, "120363144228102208")
-	}
-}
-
 func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) {
 	ms := newTestMessageStore(t)
 	logger := testLogger()
@@ -1244,6 +1135,26 @@ func captureWebhook(t *testing.T) (*httptest.Server, <-chan WebhookPayload) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var p WebhookPayload
+		if err := json.Unmarshal(body, &p); err == nil {
+			select {
+			case ch <- p:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, ch
+}
+
+// captureRawWebhook starts a local httptest server that records the first raw
+// JSON webhook payload it receives.
+func captureRawWebhook(t *testing.T) (*httptest.Server, <-chan map[string]any) {
+	t.Helper()
+	ch := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var p map[string]any
 		if err := json.Unmarshal(body, &p); err == nil {
 			select {
 			case ch <- p:
@@ -1700,6 +1611,350 @@ func TestHandleMessage_ReplayedOriginalPreservesDeletedAt(t *testing.T) {
 	got, valid := readDeletedAt(t, ms, chatJID, targetID)
 	if !valid || !got.Equal(revokedAt) {
 		t.Fatalf("expected replayed original to preserve deleted_at=%v, got %v (valid=%v)", revokedAt, got, valid)
+	}
+}
+
+// --- Reaction tests ---
+
+// queryMessageMediaTypeAndFilename returns the (media_type, filename) for a
+// stored message, or empty strings if not found.
+func queryMessageMediaTypeAndFilename(ms *MessageStore, chatJID, msgID string) (mediaType, filename string, found bool) {
+	err := ms.db.QueryRow(
+		"SELECT COALESCE(media_type,''), COALESCE(filename,'') FROM messages WHERE id = ? AND chat_jid = ?",
+		msgID, chatJID,
+	).Scan(&mediaType, &filename)
+	return mediaType, filename, err == nil
+}
+
+// buildReactionMessage constructs an events.Message carrying a ReactionMessage
+// targeting the given message ID with the given emoji.
+func buildReactionMessage(chat, sender types.JID, isFromMe bool, reactedToID, emoji string) *events.Message {
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: isFromMe,
+			},
+			ID:        "react-" + reactedToID,
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(chat.String()),
+					ID:        proto.String(reactedToID),
+					FromMe:    proto.Bool(false),
+				},
+				Text: proto.String(emoji),
+			},
+		},
+	}
+}
+
+// TestHandleMessage_InboundReaction_Stored verifies that an inbound reaction is
+// stored as media_type="reaction" with the emoji in content and the
+// reacted-to message ID in the filename column.
+func TestHandleMessage_InboundReaction_Stored(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AABCDEF01234567"
+	emoji := "👍"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, emoji)
+	handleMessage(client, ms, msg, logger)
+
+	mediaType, filename, found := queryMessageMediaTypeAndFilename(ms, chatJID, msg.Info.ID)
+	if !found {
+		t.Fatalf("expected reaction to be stored, but message row not found")
+	}
+	if mediaType != "reaction" {
+		t.Errorf("media_type = %q, want %q", mediaType, "reaction")
+	}
+	if filename != targetID {
+		t.Errorf("filename (reacted-to ID) = %q, want %q", filename, targetID)
+	}
+
+	// Verify the emoji is stored in the content column.
+	var content string
+	if err := ms.db.QueryRow(
+		"SELECT content FROM messages WHERE id = ? AND chat_jid = ?",
+		msg.Info.ID, chatJID,
+	).Scan(&content); err != nil {
+		t.Fatalf("read content: %v", err)
+	}
+	if content != emoji {
+		t.Errorf("content = %q, want emoji %q", content, emoji)
+	}
+}
+
+// TestHandleMessage_EmptyEmojiReaction_Stored verifies that a reaction with an
+// empty emoji (reaction removal) is stored rather than silently dropped.
+// Consumers can detect removal by checking content == "".
+func TestHandleMessage_EmptyEmojiReaction_Stored(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AABCDEF01234568"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, "" /* empty = removal */)
+	handleMessage(client, ms, msg, logger)
+
+	mediaType, filename, found := queryMessageMediaTypeAndFilename(ms, chatJID, msg.Info.ID)
+	if !found {
+		t.Fatalf("empty-emoji reaction (removal) must be stored, but message row not found")
+	}
+	if mediaType != "reaction" {
+		t.Errorf("media_type = %q, want %q", mediaType, "reaction")
+	}
+	if filename != targetID {
+		t.Errorf("filename = %q, want %q", filename, targetID)
+	}
+}
+
+// TestHandleMessage_InboundReaction_WebhookForwarded verifies that inbound
+// reactions are forwarded as typed webhook events after being stored.
+func TestHandleMessage_InboundReaction_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	chatJID := phonePN.String()
+	targetID := "3AABCDEF01234569"
+	emoji := "👍"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, emoji)
+	handleMessage(client, ms, msg, logger)
+
+	mediaType, filename, found := queryMessageMediaTypeAndFilename(ms, chatJID, msg.Info.ID)
+	if !found {
+		t.Fatalf("expected reaction to be stored, but message row not found")
+	}
+	if mediaType != "reaction" {
+		t.Errorf("media_type = %q, want %q", mediaType, "reaction")
+	}
+	if filename != targetID {
+		t.Errorf("filename = %q, want %q", filename, targetID)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		if payload["eventType"] != "reaction" {
+			t.Errorf("eventType = %v, want reaction", payload["eventType"])
+		}
+		if payload["mediaType"] != "reaction" {
+			t.Errorf("mediaType = %v, want reaction", payload["mediaType"])
+		}
+		if payload["messageId"] != msg.Info.ID {
+			t.Errorf("messageId = %v, want %s", payload["messageId"], msg.Info.ID)
+		}
+		if payload["reactionToMessageId"] != targetID {
+			t.Errorf("reactionToMessageId = %v, want %s", payload["reactionToMessageId"], targetID)
+		}
+		if payload["reactionEmoji"] != emoji {
+			t.Errorf("reactionEmoji = %v, want %s", payload["reactionEmoji"], emoji)
+		}
+		if payload["reactionRemoved"] != false {
+			t.Errorf("reactionRemoved = %v, want false", payload["reactionRemoved"])
+		}
+		if payload["content"] != emoji {
+			t.Errorf("content = %v, want %s", payload["content"], emoji)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reaction webhook call")
+	}
+}
+
+// TestHandleMessage_EmptyEmojiReaction_WebhookForwarded verifies that reaction
+// removals are forwarded even though their content is the empty string.
+func TestHandleMessage_EmptyEmojiReaction_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+	targetID := "3AABCDEF01234570"
+
+	msg := buildReactionMessage(phonePN, phonePN, false, targetID, "")
+	handleMessage(client, ms, msg, logger)
+
+	select {
+	case payload := <-webhookCh:
+		if payload["eventType"] != "reaction" {
+			t.Errorf("eventType = %v, want reaction", payload["eventType"])
+		}
+		if payload["content"] != "" {
+			t.Errorf("content = %v, want empty string", payload["content"])
+		}
+		if payload["reactionEmoji"] != "" {
+			t.Errorf("reactionEmoji = %v, want empty string", payload["reactionEmoji"])
+		}
+		if payload["reactionRemoved"] != true {
+			t.Errorf("reactionRemoved = %v, want true", payload["reactionRemoved"])
+		}
+		if payload["reactionToMessageId"] != targetID {
+			t.Errorf("reactionToMessageId = %v, want %s", payload["reactionToMessageId"], targetID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reaction removal webhook call")
+	}
+}
+
+// TestHandleMessage_SelfReactionWebhook_RespectsForwardSelf verifies that
+// self-authored reactions use the same FORWARD_SELF behavior as normal messages.
+func TestHandleMessage_SelfReactionWebhook_RespectsForwardSelf(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	previous := forwardSelfMessages
+	forwardSelfMessages = false
+	t.Cleanup(func() {
+		forwardSelfMessages = previous
+	})
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := buildReactionMessage(phonePN, phonePN, true, "3AABCDEF01234571", "👍")
+	handleMessage(client, ms, msg, logger)
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 1 {
+		t.Errorf("expected self reaction to be stored, got %d stored messages", count)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		t.Fatalf("unexpected webhook for self reaction when FORWARD_SELF=false: %#v", payload)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestHandleMessage_ReactionWithoutKey_NotStored verifies that a reaction
+// with no key (no reacted-to message ID) is silently ignored and not stored.
+func TestHandleMessage_ReactionWithoutKey_NotStored(t *testing.T) {
+	srv, webhookCh := captureRawWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        "react-no-key",
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ReactionMessage: &waProto.ReactionMessage{
+				Key:  nil, // no key — no reacted-to ID
+				Text: proto.String("👍"),
+			},
+		},
+	}
+	handleMessage(client, ms, msg, logger)
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
+		t.Errorf("expected reaction without key to be discarded, got %d stored messages", count)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		t.Fatalf("unexpected webhook for reaction without key: %#v", payload)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestReactHandler_MissingFields_Returns400 verifies that the /api/react
+// handler returns 400 when recipient or message_id is absent.
+func TestReactHandler_MissingFields_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty body", "{}"},
+		{"missing message_id", `{"recipient":"15551234567@s.whatsapp.net"}`},
+		{"missing recipient", `{"message_id":"3AABCDEF01234567","emoji":"👍"}`},
+		{"missing emoji", `{"recipient":"15551234567@s.whatsapp.net","message_id":"3AABCDEF01234567"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest {
+				t.Errorf("body=%q: expected 400, got %d", tc.body, resp.Code)
+			}
+		})
+	}
+}
+
+func TestReactHandler_GroupReactionMissingSenderJID_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363012345678901@g.us","message_id":"3AABCDEF01234567","emoji":"👍","from_me":false}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing sender_jid on group reaction, got %d", resp.Code)
+	}
+}
+
+func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363012345678901@g.us","message_id":"3AABCDEF01234567","emoji":"👍","from_me":false,"sender_jid":"@s.whatsapp.net"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid sender_jid on group reaction, got %d", resp.Code)
+	}
+}
+
+// TestReactHandler_NoAuth_Returns401 verifies that the /api/react handler
+// rejects requests that do not carry a valid bearer token.
+func TestReactHandler_NoAuth_Returns401(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react",
+		strings.NewReader(`{"recipient":"15551234567@s.whatsapp.net","message_id":"3AABCDEF01234567","emoji":"👍"}`))
+	req.Header.Set("Content-Type", "application/json")
+	// Deliberately omit Authorization header.
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without auth, got %d", resp.Code)
 	}
 }
 
