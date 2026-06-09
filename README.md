@@ -7,11 +7,12 @@ Standalone Go bridge for WhatsApp Web — handles message send/receive, media do
 
 ## Features
 
-- **REST API** — send/receive messages, manage media, query chats
-- **Webhook Integration** — forward incoming messages to external services
+- **REST API** — send/receive messages, manage media, send reactions, query chats
+- **Webhook Integration** — forward incoming messages and reactions to external services
 - **Media Support** — auto-download incoming media, serve via download endpoint
 - **Call History** — capture incoming voice/video calls into SQLite
 - **Local Storage** — all data in local SQLite, no cloud dependency
+- **Batch Sync** — connect, collect new messages, and exit (for scripts/cron)
 - **Launchd Integration** — install as a macOS background service
 
 ## Installation
@@ -129,6 +130,9 @@ message DBs, media, and `.bridge-token`. Logs are left in
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
 | `--full-history-pair` | `false` | Request full history at pair time. Only takes effect on a fresh pair (no existing `whatsapp.db`); no-op for already-paired sessions. The phone ultimately decides the actual history window sent — see [Requesting full history](#requesting-full-history) below. |
+| `--batch` | `false` | Run in batch mode: connect, collect new messages until idle, then exit. Reads existing session; requires a prior pairing in normal mode. |
+| `--batch-idle-timeout` | `15` | Seconds without new messages before batch sync completes. |
+| `--batch-max-duration` | `300` | Hard limit in seconds for batch sync. |
 
 ### Requesting full history
 
@@ -198,6 +202,35 @@ CREATE TABLE calls (
   expose media type directly (it's buried in the binary call data). Group
   calls via `CallOfferNotice` include a `Media` field and are recorded
   accurately as voice or video.
+
+## Messages Schema
+
+The `messages` table in `messages.db` stores all message data:
+
+```sql
+CREATE TABLE messages (
+    id TEXT,
+    chat_jid TEXT,
+    sender TEXT,
+    content TEXT,
+    timestamp TIMESTAMP,
+    is_from_me BOOLEAN,
+    media_type TEXT,        -- 'image', 'video', 'audio', 'document', 'reaction'
+    filename TEXT,          -- for media: saved filename; for reactions: reacted-to message ID
+    url TEXT,
+    media_key BLOB,
+    file_sha256 BLOB,
+    file_enc_sha256 BLOB,
+    file_length INTEGER,
+    deleted_at TIMESTAMP,
+    quoted_message_id TEXT,
+    inserted_at TIMESTAMP,  -- set on first insert, never overwritten
+    PRIMARY KEY (id, chat_jid),
+    FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+);
+```
+
+Reactions are stored as regular rows with `media_type='reaction'`, the emoji in `content`, and the target message ID in `filename`.
 
 ## Development
 
